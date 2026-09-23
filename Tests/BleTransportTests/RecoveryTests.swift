@@ -192,6 +192,62 @@ final class RecoveryTests: XCTestCase {
     }
 
     @MainActor
+    func testHandshakeFailureWaitsForAsynchronousCancellationBeforeRetry() async {
+        let radio = Radio()
+        radio.answerMtu = false
+        radio.failWrite = true
+        radio.deferDisconnect = true
+        let cancelled = expectation(description: "radio cancellation requested")
+        let failed = expectation(description: "handshake failure delivered after disconnect")
+        let recovered = expectation(description: "retry connected")
+        radio.onCancel = { cancelled.fulfill() }
+        let transport = BleTransport(configuration: nil, debugMode: false, module: radio)
+        var failures = 0
+        transport.connect(toPeripheralID: radio.device, disconnectedCallback: nil,
+                          success: { _ in XCTFail("failed handshake succeeded") },
+                          failure: { error in
+            failures += 1
+            XCTAssertEqual(error.id, BleTransportError.writeError(description: "").id)
+            transport.connect(toPeripheralID: radio.device, disconnectedCallback: nil,
+                              success: { _ in recovered.fulfill() },
+                              failure: { XCTFail("retry failed: \($0)") })
+            failed.fulfill()
+        })
+        await fulfillment(of: [cancelled], timeout: 2)
+        XCTAssertEqual(failures, 0)
+        radio.answerMtu = true
+        radio.failWrite = false
+        radio.loseConnection()
+        await fulfillment(of: [failed, recovered], timeout: 2)
+        XCTAssertEqual(failures, 1)
+        XCTAssertEqual(radio.connects, 2)
+    }
+
+    @MainActor
+    func testHandshakeTimeoutWaitsForAsynchronousCancellation() async {
+        let radio = Radio()
+        radio.answerMtu = false
+        radio.deferDisconnect = true
+        let cancelled = expectation(description: "timed-out handshake cancellation requested")
+        let failed = expectation(description: "timeout delivered after disconnect")
+        radio.onCancel = { cancelled.fulfill() }
+        let transport = BleTransport(configuration: nil, debugMode: false, module: radio, handshakeTimeout: 0.01)
+        var failures = 0
+        transport.connect(toPeripheralID: radio.device, disconnectedCallback: nil,
+                          success: { _ in XCTFail("timed-out handshake succeeded") },
+                          failure: { error in
+            failures += 1
+            XCTAssertEqual(error.id, BleTransportError.connectError(description: "").id)
+            failed.fulfill()
+        })
+        await fulfillment(of: [cancelled], timeout: 2)
+        XCTAssertEqual(failures, 0)
+        radio.loseConnection()
+        await fulfillment(of: [failed], timeout: 2)
+        XCTAssertEqual(failures, 1)
+    }
+
+    @MainActor
     func testDisconnectAlsoFinishesQueuedDisconnectAndEmptyQueueDrain() async {
         let radio = Radio()
         let transport = await connected(radio)
@@ -377,6 +433,7 @@ private final class Radio: BleTransportIO {
     var answerMtu = true
     var failWrite = false
     var deferDisconnect = false
+    var onCancel: (() -> Void)?
     var listenCharacteristics: [CharacteristicIdentifier] = []
     var writeCharacteristics: [CharacteristicIdentifier] = []
     func start(delegate: BleModuleDelegate) { self.delegate = delegate }
@@ -404,7 +461,7 @@ private final class Radio: BleTransportIO {
         if !deferDisconnect { loseConnection() }
     }
     var cancellations = 0
-    func cancelConnection() { cancellations += 1; if !deferDisconnect { loseConnection() } }
+    func cancelConnection() { cancellations += 1; onCancel?(); if !deferDisconnect { loseConnection() } }
     func loseConnection(error: Error? = nil) { delegate?.disconnected(from: device, error: error) }
     func deliver(_ bytes: [UInt8]) { listener?(Data(bytes)) }
 }

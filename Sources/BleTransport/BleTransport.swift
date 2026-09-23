@@ -57,6 +57,7 @@ extension BleTransport: BleModuleDelegate {
     private var connectionGeneration = 0
     private var connectionUsable = false
     private var connectSuccess: PeripheralResponse?
+    private var pendingConnectFailure: BleTransportError?
     private var handshakeTimer: Timer?
 
     private func finishExchange(_ result: Result<String, BleTransportError>) {
@@ -84,17 +85,23 @@ extension BleTransport: BleModuleDelegate {
     }
 
     private func failConnect(_ error: BleTransportError) {
+        guard connectFailure != nil, pendingConnectFailure == nil else { return }
         handshakeTimer?.invalidate()
         handshakeTimer = nil
-        let failure = connectFailure
-        connectFailure = nil
         connectSuccess = nil
         mtuWaitingForCallback = nil
         connectionUsable = false
         // A handshake failure can leave GATT connected with an unfinished
-        // characteristic operation. Cancel through CoreBluetooth, not that queue.
-        if connectedPeripheral != nil { bleModule.cancelConnection() }
-        failure?(error)
+        // characteristic operation. Report it only after radio teardown.
+        if connectedPeripheral != nil {
+            pendingConnectFailure = error
+            disconnecting = true
+            bleModule.cancelConnection()
+        } else {
+            let failure = connectFailure
+            connectFailure = nil
+            failure?(error)
+        }
     }
 
     /// Infer MTU
@@ -146,7 +153,11 @@ extension BleTransport: BleModuleDelegate {
                 self.updatePeripheralsServicesTuple(discoveries: discoveries)
                 if let error = error {
                     print("Stopped scanning with error: \(error)")
-                    stopped(.underlying(error: error as NSError, fallback: .scanError(description: error.localizedDescription)))
+                    if let transportError = error as? BleTransportError {
+                        stopped(transportError)
+                    } else {
+                        stopped(.underlying(error: error as NSError, fallback: .scanError(description: error.localizedDescription)))
+                    }
                 } else if timedOut {
                     stopped(.scanningTimedOut)
                 } else {
@@ -598,7 +609,9 @@ extension BleTransport: BleModuleDelegate {
         handshakeTimer?.invalidate()
         handshakeTimer = nil
         let connectError = connectFailure
+        let pendingConnectFailure = pendingConnectFailure
         connectFailure = nil
+        self.pendingConnectFailure = nil
         connectSuccess = nil
         mtuWaitingForCallback = nil
         let notify = notifyDisconnectedCompletion
@@ -611,7 +624,7 @@ extension BleTransport: BleModuleDelegate {
         let exchangeFailure = BleTransportError.currentConnectedError(description: "Ledger disconnected")
         let connectionFailure = BleTransportError.connectError(description: "Ledger disconnected during initialization")
         finishExchange(.failure(error.map { .underlying(error: $0 as NSError, fallback: exchangeFailure) } ?? exchangeFailure))
-        connectError?(error.map { .underlying(error: $0 as NSError, fallback: connectionFailure) } ?? connectionFailure)
+        connectError?(pendingConnectFailure ?? error.map { .underlying(error: $0 as NSError, fallback: connectionFailure) } ?? connectionFailure)
         notify?()
         disconnected?(error)
         disconnectedResult?(nil)

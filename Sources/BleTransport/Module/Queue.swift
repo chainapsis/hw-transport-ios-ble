@@ -19,9 +19,13 @@ class Queue {
         queue.first
     }
 
-    func add(_ operation: TaskOperation, isCurrent: @escaping () -> Bool = { true }, finished: EmptyResponse? = nil) {
+    func add(_ operation: TaskOperation, isCurrent: @escaping () -> Bool = { true }, rejected: EmptyResponse? = nil, finished: EmptyResponse? = nil) {
         DispatchQueue.main.async {
-            guard isCurrent() else { operation.discard(); finished?(); return }
+            guard isCurrent() else {
+                if let rejected { rejected() } else { operation.discard() }
+                finished?()
+                return
+            }
             self.queue.append(operation)
             if self.queue.count == 1 {
                 self.queue.first?.start()

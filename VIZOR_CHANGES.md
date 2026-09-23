@@ -53,3 +53,7 @@ Disconnect review follow-up: module queue and generation cleanup now precede
 connection-failure callbacks. An exchange completion reserves an earlier queued
 disconnect before client code can reenter the transport. Simulated tests cover
 callback ordering and ownership; physical BLE behavior still needs device QA.
+
+Radio loss now terminates active and queued scans with `bluetoothNotAvailable`
+after clearing stale operations. Handshake failures wait for physical disconnect
+before notifying callers, so a callback can retry against the cleaned link.

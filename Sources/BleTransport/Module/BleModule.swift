@@ -78,6 +78,12 @@ public class BleModule: NSObject {
         let generation = connectionGeneration
         self.operationsQueue.add(operation, isCurrent: { [weak self] in
             self?.connectionGeneration == generation
+        }, rejected: { [weak self] in
+            guard let scan = operation as? Scan else { operation.discard(); return }
+            let error: BleTransportError = self?.isBluetoothAvailable == false
+                ? .bluetoothNotAvailable
+                : .scanError(description: "Scan invalidated before starting")
+            scan.discardReporting(error)?()
         })
     }
 
@@ -105,7 +111,17 @@ extension BleModule {
               stopped: @escaping ([ScanDiscovery], Error?, Bool) -> Void) {
         let generation = connectionGeneration
         DispatchQueue.main.async {
-            guard generation == self.connectionGeneration else { return }
+            guard generation == self.connectionGeneration else {
+                let error: BleTransportError = self.isBluetoothAvailable
+                    ? .scanError(description: "Scan invalidated before starting")
+                    : .bluetoothNotAvailable
+                stopped([], error, false)
+                return
+            }
+            guard self.isBluetoothAvailable else {
+                stopped([], BleTransportError.bluetoothNotAvailable, false)
+                return
+            }
             let scanOperation = Scan(duration: duration, throttleRSSIDelta: throttleRSSIDelta, serviceIdentifiers: serviceIdentifiers, discovery: discovery, expired: expired, stopped: stopped, manager: self.cbCentralManager)
             self.addOperation(scanOperation)
         }
@@ -230,7 +246,11 @@ extension BleModule: CBCentralManagerDelegate {
             connectedPeripheral?.invalidate()
             connectedPeripheral = nil
             listeners.removeAll()
+            let scanCompletions = operationsQueue.operationsOfType(Scan.self).compactMap {
+                $0.discardReporting(BleTransportError.bluetoothNotAvailable)
+            }
             operationsQueue.discardAll()
+            scanCompletions.forEach { $0() }
         }
         delegate.bluetoothAvailable(central.state == .poweredOn)
         delegate.bluetoothState(central.state)

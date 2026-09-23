@@ -14,10 +14,21 @@ final class ScanLifetimeTests: XCTestCase {
     func testRadioOffDiscardCannotStopReplacementScan() async {
         let radio = ScanTestRadio()
         let queue = Queue()
-        let old = makeScan(radio, duration: 0.1) { XCTFail("discarded scan callback") }
+        var failures = 0
+        let old = Scan(duration: 0.1, throttleRSSIDelta: 5,
+            serviceIdentifiers: [ServiceIdentifier(uuid: "1800")],
+            discovery: { _, _ in .continue }, expired: nil,
+            stopped: { _, error, timedOut in
+                XCTAssertEqual(error as? BleTransportError, .bluetoothNotAvailable)
+                XCTAssertFalse(timedOut)
+                failures += 1
+            }, manager: radio)
         await enqueue(old, in: queue)
         radio.state = .poweredOff
+        let reportUnavailable = old.discardReporting(BleTransportError.bluetoothNotAvailable)
         queue.discardAll()
+        reportUnavailable?()
+        XCTAssertEqual(failures, 1)
         radio.state = .poweredOn
         let fresh = makeScan(radio, duration: 10)
         await enqueue(fresh, in: queue)
@@ -30,9 +41,11 @@ final class ScanLifetimeTests: XCTestCase {
         old.timeoutTimerAction(Timer())
         old.stopScanning()
         old.start()
+        XCTAssertNil(old.discardReporting(BleTransportError.bluetoothNotAvailable))
         XCTAssertTrue(radio.scanning)
         XCTAssertEqual(radio.starts, 2)
         XCTAssertEqual(radio.stops, 0)
+        XCTAssertEqual(failures, 1)
         fresh.stopScanning()
     }
 
@@ -122,6 +135,29 @@ final class ScanLifetimeTests: XCTestCase {
         XCTAssertEqual(radio.starts, 1)
         XCTAssertEqual(radio.stops, 0)
         active.stopScanning()
+    }
+
+    @MainActor
+    func testScanRejectedAfterRadioLossReportsTerminalError() async {
+        let radio = ScanTestRadio()
+        let queue = Queue()
+        let stopped = expectation(description: "rejected scan stopped")
+        let scan = Scan(duration: 10, throttleRSSIDelta: 5,
+            serviceIdentifiers: [ServiceIdentifier(uuid: "1800")],
+            discovery: { _, _ in .continue }, expired: nil,
+            stopped: { _, error, timedOut in
+                XCTAssertEqual(error as? BleTransportError, .bluetoothNotAvailable)
+                XCTAssertFalse(timedOut)
+                stopped.fulfill()
+            }, manager: radio)
+        let added = expectation(description: "rejected add returned")
+        radio.state = .poweredOff
+        queue.add(scan, isCurrent: { false }, rejected: {
+            scan.discardReporting(BleTransportError.bluetoothNotAvailable)?()
+        }) { added.fulfill() }
+        await fulfillment(of: [stopped, added], timeout: 2)
+        XCTAssertEqual(radio.starts, 0)
+        XCTAssertTrue(queue.isEmpty)
     }
 }
 

@@ -157,6 +157,17 @@ public class Scan: TaskOperation {
         if isStarted, manager.state == .poweredOn { manager.stopScan() }
     }
 
+    // Detach the callback before the queue is cleared, then publish the error
+    // after cleanup so a callback can safely start a replacement scan.
+    func discardReporting(_ error: Error) -> (() -> Void)? {
+        guard !isFinished else { return nil }
+        let completion = stopped
+        let discoveries = discoveries
+        discard()
+        guard let completion else { return nil }
+        return { completion(discoveries, error, false) }
+    }
+
     private func stopScan(with discoveries: [ScanDiscovery], error: Error?, timedOut: Bool) {
         guard !isFinished else { return }
         let completion = stopped
