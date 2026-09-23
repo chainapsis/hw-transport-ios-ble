@@ -1,6 +1,6 @@
 //
 //  BleTransportError.swift
-//  
+//
 //
 //  Created by Harrison on 1/13/23.
 //
@@ -9,6 +9,14 @@ import Foundation
 
 /// Errors thrown when scanning/sending/receiving/connecting
 public enum BleTransportError: LocalizedError {
+    /// Keep CoreBluetooth identity alongside the transport operation context.
+    indirect case underlying(error: NSError, fallback: BleTransportError)
+
+    public var underlyingError: NSError? {
+        if case .underlying(let error, _) = self { return error }
+        return nil
+    }
+
     case pendingActionOnDevice
     case userRefusedOnDevice
     case scanningTimedOut
@@ -21,9 +29,11 @@ public enum BleTransportError: LocalizedError {
     case scanError(description: String)
     case pairingError(description: String)
     case lowerLevelError(description: String)
-    
+
     public var errorDescription: String? {
         switch self {
+        case .underlying(_, let fallback):
+            return fallback.errorDescription
         case .pendingActionOnDevice:
             return "Pending action on device"
         case .userRefusedOnDevice:
@@ -51,10 +61,12 @@ public enum BleTransportError: LocalizedError {
             return "Lower level error: \(description)"
         }
     }
-    
+
     /// `id` is defined by what the JS bindings are returning and using for error handling
     public var id: String? {
         switch self {
+        case .underlying(_, let fallback):
+            return fallback.id
         case .pendingActionOnDevice:
             return "TransportRaceCondition"
         case .userRefusedOnDevice:
@@ -87,6 +99,8 @@ public enum BleTransportError: LocalizedError {
 extension BleTransportError: Equatable {
     public static func == (lhs: BleTransportError, rhs: BleTransportError) -> Bool {
         switch (lhs, rhs) {
+        case (.underlying(let lhsError, let lhsFallback), .underlying(let rhsError, let rhsFallback)):
+            return lhsError.domain == rhsError.domain && lhsError.code == rhsError.code && lhsFallback == rhsFallback
         case (.pendingActionOnDevice, .pendingActionOnDevice):
             return true
         case (.userRefusedOnDevice, .userRefusedOnDevice):
@@ -116,4 +130,3 @@ extension BleTransportError: Equatable {
         }
     }
 }
-

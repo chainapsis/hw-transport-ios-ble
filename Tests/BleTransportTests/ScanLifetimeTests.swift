@@ -1,0 +1,216 @@
+import XCTest
+import CoreBluetooth
+@testable import BleTransport
+
+final class ScanLifetimeTests: XCTestCase {
+    @MainActor
+    private func enqueue(_ scan: Scan, in queue: Queue, isCurrent: @escaping () -> Bool = { true }) async {
+        let added = expectation(description: "scan enqueued")
+        queue.add(scan, isCurrent: isCurrent) { added.fulfill() }
+        await fulfillment(of: [added], timeout: 2)
+    }
+
+    @MainActor
+    func testRadioOffDiscardCannotStopReplacementScan() async {
+        let radio = ScanTestRadio()
+        let queue = Queue()
+        var failures = 0
+        let old = Scan(duration: 0.1, throttleRSSIDelta: 5,
+            serviceIdentifiers: [ServiceIdentifier(uuid: "1800")],
+            discovery: { _, _ in .continue }, expired: nil,
+            stopped: { _, error, timedOut in
+                XCTAssertEqual(error as? BleTransportError, .bluetoothNotAvailable)
+                XCTAssertFalse(timedOut)
+                failures += 1
+            }, manager: radio)
+        await enqueue(old, in: queue)
+        radio.state = .poweredOff
+        let reportUnavailable = old.discardReporting(BleTransportError.bluetoothNotAvailable)
+        queue.discardAll()
+        reportUnavailable?()
+        XCTAssertEqual(failures, 1)
+        radio.state = .poweredOn
+        let fresh = makeScan(radio, duration: 10)
+        await enqueue(fresh, in: queue)
+        let elapsed = expectation(description: "original timeout has elapsed")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { elapsed.fulfill() }
+        await fulfillment(of: [elapsed], timeout: 2)
+        XCTAssertTrue(radio.scanning)
+        XCTAssertEqual(radio.stops, 0)
+        // An already delivered timeout or explicit stale stop must be inert too.
+        old.timeoutTimerAction(Timer())
+        old.stopScanning()
+        old.start()
+        XCTAssertNil(old.discardReporting(BleTransportError.bluetoothNotAvailable))
+        XCTAssertTrue(radio.scanning)
+        XCTAssertEqual(radio.starts, 2)
+        XCTAssertEqual(radio.stops, 0)
+        XCTAssertEqual(failures, 1)
+        fresh.stopScanning()
+    }
+
+    @MainActor
+    func testDiscardReleasesScanAndCapturedCallbacksImmediately() async {
+        let radio = ScanTestRadio()
+        let queue = Queue()
+        weak var releasedScan: Scan?
+        weak var releasedCapture: NSObject?
+        do {
+            let capture = NSObject()
+            let scan = makeScan(radio, duration: 60) { _ = capture.description }
+            releasedScan = scan
+            releasedCapture = capture
+            await enqueue(scan, in: queue)
+        }
+        queue.discardAll()
+        XCTAssertNil(releasedScan)
+        XCTAssertNil(releasedCapture)
+        XCTAssertFalse(radio.scanning)
+    }
+
+    @MainActor
+    func testQueuedExpiryAndLateDiscoveryAreIgnoredAfterDiscard() async {
+        let radio = ScanTestRadio()
+        let queue = Queue()
+        var discoveries = 0
+        let old = Scan(duration: 10, throttleRSSIDelta: 5,
+            serviceIdentifiers: [ServiceIdentifier(uuid: "1800")],
+            discovery: { _, _ in discoveries += 1; return .continue },
+            expired: { _, _ in .stop },
+            stopped: { _, _, _ in XCTFail("discarded expiry callback") }, manager: radio)
+        await enqueue(old, in: queue)
+        let device = ScanDiscovery(peripheralIdentifier: PeripheralIdentifier(uuid: UUID(), name: "Ledger"), advertisementPacket: [:], rssi: -40)
+        old.discovered(device)
+        let expiry = Timer(timeInterval: 1, target: NSObject(), selector: Selector(("unused")), userInfo: device.peripheralIdentifier.uuid, repeats: false)
+        old.refresh(timer: expiry) // Enqueues asynchronous stop from expiry callback.
+        radio.state = .poweredOff
+        queue.discardAll()
+        radio.state = .poweredOn
+        let fresh = makeScan(radio, duration: 10)
+        await enqueue(fresh, in: queue)
+        old.discovered(device)
+        old.refresh(timer: expiry)
+        XCTAssertEqual(discoveries, 1)
+        XCTAssertTrue(radio.scanning)
+        XCTAssertEqual(radio.stops, 0)
+        fresh.stopScanning()
+    }
+
+    @MainActor
+    func testNormalStopNotifiesAndDrainsOnlyOnce() async {
+        let radio = ScanTestRadio()
+        let queue = Queue()
+        var completions = 0
+        var drains = 0
+        let scan = makeScan(radio, duration: 10) { completions += 1 }
+        scan.finished = { drains += 1 }
+        await enqueue(scan, in: queue)
+        scan.stopScanning()
+        scan.timeoutTimerAction(Timer())
+        scan.stopScanning()
+        queue.discardAll()
+        XCTAssertEqual(completions, 1)
+        XCTAssertEqual(drains, 1)
+        XCTAssertEqual(radio.stops, 1)
+    }
+
+    @MainActor
+    func testRejectedQueuedScanReleasesCallbacksWithoutStoppingActiveScan() async {
+        let radio = ScanTestRadio()
+        let queue = Queue()
+        let active = makeScan(radio, duration: 10)
+        await enqueue(active, in: queue)
+        weak var capture: NSObject?
+        let rejected: Scan
+        do {
+            let owner = NSObject()
+            capture = owner
+            rejected = makeScan(radio, duration: 10) { _ = owner.description }
+        }
+        await enqueue(rejected, in: queue, isCurrent: { false })
+        XCTAssertNil(capture)
+        rejected.stopScanning()
+        rejected.start()
+        XCTAssertTrue(radio.scanning)
+        XCTAssertEqual(radio.starts, 1)
+        XCTAssertEqual(radio.stops, 0)
+        active.stopScanning()
+    }
+
+    @MainActor
+    func testScanRejectedAfterRadioLossReportsTerminalError() async {
+        let radio = ScanTestRadio()
+        let queue = Queue()
+        let stopped = expectation(description: "rejected scan stopped")
+        let scan = Scan(duration: 10, throttleRSSIDelta: 5,
+            serviceIdentifiers: [ServiceIdentifier(uuid: "1800")],
+            discovery: { _, _ in .continue }, expired: nil,
+            stopped: { _, error, timedOut in
+                XCTAssertEqual(error as? BleTransportError, .bluetoothNotAvailable)
+                XCTAssertFalse(timedOut)
+                stopped.fulfill()
+            }, manager: radio)
+        let added = expectation(description: "rejected add returned")
+        radio.state = .poweredOff
+        queue.add(scan, isCurrent: { false }, rejected: {
+            scan.discardReporting(BleTransportError.bluetoothNotAvailable)?()
+        }) { added.fulfill() }
+        await fulfillment(of: [stopped, added], timeout: 2)
+        XCTAssertEqual(radio.starts, 0)
+        XCTAssertTrue(queue.isEmpty)
+    }
+
+    @MainActor
+    func testStoppingQueuedScanLetsFollowingOperationRun() async {
+        let radio = ScanTestRadio()
+        let queue = Queue()
+        let blocker = QueueMarkerOperation()
+        let scanStopped = expectation(description: "queued scan stopped")
+        let scan = makeScan(radio, duration: 10) { scanStopped.fulfill() }
+        let followingStarted = expectation(description: "operation after scan started")
+        let following = QueueMarkerOperation { followingStarted.fulfill() }
+        blocker.finished = { queue.finish(blocker) }
+        scan.finished = { queue.finish(scan) }
+        let added = expectation(description: "all operations queued")
+        added.expectedFulfillmentCount = 3
+        queue.add(blocker) { added.fulfill() }
+        queue.add(scan) { added.fulfill() }
+        queue.add(following) { added.fulfill() }
+        await fulfillment(of: [added], timeout: 2)
+
+        scan.stopScanning()
+        await fulfillment(of: [scanStopped], timeout: 2)
+        XCTAssertEqual(queue.queue.count, 2)
+        XCTAssertEqual(radio.starts, 0)
+        blocker.finished?()
+        await fulfillment(of: [followingStarted], timeout: 2)
+        XCTAssertEqual(following.starts, 1)
+    }
+}
+
+private final class QueueMarkerOperation: TaskOperation {
+    var finished: EmptyResponse?
+    var starts = 0
+    let onStart: () -> Void
+    init(onStart: @escaping () -> Void = {}) { self.onStart = onStart }
+    func start() { starts += 1; onStart() }
+}
+
+private func makeScan(_ radio: ScanTestRadio, duration: TimeInterval, stopped: @escaping () -> Void = {}) -> Scan {
+    Scan(duration: duration, throttleRSSIDelta: 5,
+         serviceIdentifiers: [ServiceIdentifier(uuid: "1800")],
+         discovery: { _, _ in .continue }, expired: nil,
+         stopped: { _, _, _ in stopped() }, manager: radio)
+}
+
+private final class ScanTestRadio: ScanRadio {
+    var state: CBManagerState = .poweredOn
+    var scanning = false
+    var starts = 0
+    var stops = 0
+    func scanForPeripherals(withServices serviceUUIDs: [CBUUID]?, options: [String: Any]?) {
+        scanning = true
+        starts += 1
+    }
+    func stopScan() { scanning = false; stops += 1 }
+}

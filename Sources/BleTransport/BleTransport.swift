@@ -10,89 +10,133 @@ import CoreBluetooth
 
 
 extension BleTransport: BleModuleDelegate {
-    func disconnected(from peripheral: PeripheralIdentifier) {
-        clearConnection()
+    func disconnected(from peripheral: PeripheralIdentifier, error: Error?) {
+        clearConnection(error: error)
     }
-    
+
     func bluetoothAvailable(_ available: Bool) {
         bluetoothAvailabilityCompletion?(available)
         if !available {
             clearConnection()
         }
     }
-    
+
     func bluetoothState(_ state: CBManagerState) {
         bluetoothStateCompletion?(state)
     }
 }
 
 @objc public class BleTransport: NSObject, BleTransportProtocol {
-    
-    typealias ConnectFunction = (PeripheralIdentifier) -> ()
-    
+
     public static var shared: BleTransportProtocol = BleTransport(configuration: nil, debugMode: false)
-    
-    private let bleModule: BleModule
-    
+
+    private let bleModule: BleTransportIO
+    private let handshakeTimeout: TimeInterval
+
     private let debugMode: Bool
-    
+
     private let configuration: BleTransportConfiguration
-    private var disconnectedCallback: EmptyResponse? /// Once `disconnectCallback` is set it never becomes `nil` again so we can reuse it in methods where we reconnect to the peripheral blindly like `openApp/closeApp`
+    private var disconnectedCallback: DisconnectionResponse? /// Once `disconnectCallback` is set it never becomes `nil` again so we can reuse it in methods where we reconnect to the peripheral blindly like `openApp/closeApp`
     private var connectFailure: ((BleTransportError)->())?
-    
+
     private var scanDuration: TimeInterval = 5.0 /// `scanDuration` will be overriden every time a value gets passed to `scan/create`
-    
+
     private var peripheralsServicesTuple = [PeripheralInfo]()
     private var connectedPeripheral: PeripheralIdentifier?
     private var bluetoothAvailabilityCompletion: ((Bool)->())?
     private var bluetoothStateCompletion: ((CBManagerState)->())?
     private var notifyDisconnectedCompletion: EmptyResponse?
-    
-    /// Exchange handling
-    private var exchangeCallback: ((Result<String, BleTransportError>) -> Void)?
-    private var isExchanging = false {
-        didSet {
-            if !isExchanging, let waitingToDisconnectCompletion = waitingToDisconnectCompletion {
-                disconnect(completion: waitingToDisconnectCompletion)
-            }
+
+    // One exchange owns response assembly and completion. All access is on main.
+    private var pendingExchange: PendingBleExchange?
+    private var abortingExchange = false
+    private var isExchanging: Bool { pendingExchange != nil }
+    private var waitingToDisconnectCompletion: OptionalBleErrorResponse?
+    private var disconnecting = false
+    private var disconnectCompletion: OptionalBleErrorResponse?
+    private var connectionGeneration = 0
+    private var connectionUsable = false
+    private var connectSuccess: PeripheralResponse?
+    private var pendingConnectFailure: BleTransportError?
+    private var handshakeTimer: Timer?
+
+    private func finishExchange(_ result: Result<String, BleTransportError>) {
+        let pending = pendingExchange
+        pendingExchange = nil
+        if case .failure = result { connectionUsable = false }
+        let queuedDisconnect = waitingToDisconnectCompletion
+        waitingToDisconnectCompletion = nil
+        // Reserve the earlier request before the exchange callback can reenter.
+        let shouldDisconnect = queuedDisconnect != nil && isConnected && !disconnecting
+        if shouldDisconnect {
+            disconnecting = true
+            disconnectCompletion = queuedDisconnect
+            connectionUsable = false
+        }
+        pending?.finish(result)
+        if shouldDisconnect {
+            // The callback may itself have observed a physical disconnect.
+            if disconnecting { startPhysicalDisconnect() }
+        } else {
+            // A lost connection settles the queued request for the old link,
+            // even if the exchange callback reconnects synchronously.
+            queuedDisconnect?(nil)
         }
     }
-    private var currentResponse = ""
-    private var currentResponseRemainingLength = 0
-    private var waitingToDisconnectCompletion: OptionalBleErrorResponse?
-    
+
+    private func failConnect(_ error: BleTransportError) {
+        guard connectFailure != nil, pendingConnectFailure == nil else { return }
+        handshakeTimer?.invalidate()
+        handshakeTimer = nil
+        connectSuccess = nil
+        mtuWaitingForCallback = nil
+        connectionUsable = false
+        // A handshake failure can leave GATT connected with an unfinished
+        // characteristic operation. Report it only after radio teardown.
+        if connectedPeripheral != nil {
+            pendingConnectFailure = error
+            disconnecting = true
+            bleModule.cancelConnection()
+        } else {
+            let failure = connectFailure
+            connectFailure = nil
+            failure?(error)
+        }
+    }
+
     /// Infer MTU
     private var mtuWaitingForCallback: PeripheralResponse?
-    
+
     @objc
     public var isBluetoothAvailable: Bool {
         bleModule.isBluetoothAvailable
     }
-    
+
     @objc
     public var isConnected: Bool {
         connectedPeripheral != nil
     }
-    
+
     // MARK: - Initialization
-    
-    private init(configuration: BleTransportConfiguration?, debugMode: Bool) {
-        self.bleModule = BleModule()
+
+    init(configuration: BleTransportConfiguration?, debugMode: Bool, module: BleTransportIO = BleModule(), handshakeTimeout: TimeInterval = 60) {
+        self.bleModule = module
+        self.handshakeTimeout = handshakeTimeout
         self.configuration = configuration ?? BleTransportConfiguration.defaultConfig()
         self.debugMode = debugMode
-        
+
         super.init()
 
         self.bleModule.start(delegate: self)
     }
-    
+
     // MARK: - Public Methods
-    
+
     public func scan(duration: TimeInterval, callback: @escaping PeripheralsWithServicesResponse, stopped: @escaping OptionalBleErrorResponse) {
         DispatchQueue.main.async {
             self.peripheralsServicesTuple = [] /// We clean `peripheralsServicesTuple` at the start of each scan so the changes can be properly propagated and not before because it has info needed for connecting and writing to peripherals
-            
-            self.bleModule.scan(duration: duration, serviceIdentifiers: self.configuration.services.map({ $0.service }), discovery: { [weak self] discovery, discoveries in
+
+            self.bleModule.scanLedger(duration: duration, serviceIdentifiers: self.configuration.services.map({ $0.service }), discovery: { [weak self] discovery, discoveries in
                 guard let self = self else { return .continue }
                 if self.updatePeripheralsServicesTuple(discoveries: discoveries) {
                     callback(self.peripheralsServicesTuple)
@@ -109,7 +153,11 @@ extension BleTransport: BleModuleDelegate {
                 self.updatePeripheralsServicesTuple(discoveries: discoveries)
                 if let error = error {
                     print("Stopped scanning with error: \(error)")
-                    stopped(.scanError(description: error.localizedDescription))
+                    if let transportError = error as? BleTransportError {
+                        stopped(transportError)
+                    } else {
+                        stopped(.underlying(error: error as NSError, fallback: .scanError(description: error.localizedDescription)))
+                    }
                 } else if timedOut {
                     stopped(.scanningTimedOut)
                 } else {
@@ -118,28 +166,28 @@ extension BleTransport: BleModuleDelegate {
             })
         }
     }
-    
+
     @objc
     public func stopScanning() {
         DispatchQueue.main.async {
             self.bleModule.stopScanning()
         }
     }
-    
-    public func create(scanDuration: TimeInterval, disconnectedCallback: EmptyResponse?, success: @escaping PeripheralResponse, failure: @escaping BleErrorResponse) {
-        
+
+    public func create(scanDuration: TimeInterval, disconnectedCallback: DisconnectionResponse?, success: @escaping PeripheralResponse, failure: @escaping BleErrorResponse) {
+
         guard isBluetoothAvailable else { failure(.bluetoothNotAvailable); return }
-        
+
         self.scanDuration = scanDuration
-        
+
         var connecting = false
-        
+
         func attemptConnecting(peripheralInfo: PeripheralInfo) {
             connect(toPeripheralID: peripheralInfo.peripheral, disconnectedCallback: disconnectedCallback, success: { connectedPeripheral in
                 success(connectedPeripheral)
             }, failure: failure)
         }
-        
+
         self.scan(duration: scanDuration) { discoveries in
             guard let firstDiscovery = discoveries.first else { return }
             if !connecting {
@@ -152,27 +200,29 @@ extension BleTransport: BleModuleDelegate {
             }
         }
     }
-    
+
     public func exchange(apdu apduToSend: APDU, callback: @escaping (Result<String, BleTransportError>) -> Void) {
         DispatchQueue.main.async {
             guard !self.isExchanging else {
                 callback(.failure(.pendingActionOnDevice))
                 return
             }
-            
-            print("Sending", "->", apduToSend.data.hexEncodedString())
-            self.exchangeCallback = callback
-            self.isExchanging = true
+
+            guard self.connectionUsable else {
+                callback(.failure(.currentConnectedError(description: "Reconnect the Ledger before sending another request")))
+                return
+            }
+            self.pendingExchange = PendingBleExchange(completion: callback)
             self.writeAPDU(apduToSend)
         }
     }
-    
+
     public func send(apdu: APDU, success: @escaping EmptyResponse, failure: @escaping BleErrorResponse) {
         DispatchQueue.main.async {
             self.send(value: apdu, success: success, failure: failure)
         }
     }
-    
+
     /// The inner implementation of `send`
     /// - Parameters:
     ///   - value: APDU to send
@@ -180,6 +230,7 @@ extension BleTransport: BleModuleDelegate {
     ///   - success: The success callback
     ///   - failure: The failue callback
     fileprivate func send<S: Sendable>(value: S, retryWithResponse: Bool = false, success: @escaping EmptyResponse, failure: @escaping BleErrorResponse) {
+        let generation = connectionGeneration
         let connectedPeripheral: PeripheralIdentifier
         let connectedPeripheralTuple: PeripheralInfo
         let peripheralService: BleService
@@ -202,6 +253,7 @@ extension BleTransport: BleModuleDelegate {
         }
         self.bleModule.write(to: writeCharacteristic, value: value, type: type) { [weak self] result in
             guard let self = self else { failure(.writeError(description: "Self got deallocated")); return }
+            guard generation == self.connectionGeneration else { return }
             switch result {
             case .success:
                 if connectedPeripheralTuple.canWriteWithoutResponse == nil {
@@ -211,78 +263,141 @@ extension BleTransport: BleModuleDelegate {
                 }
                 success()
             case .failure(let error):
-                if connectedPeripheralTuple.canWriteWithoutResponse == nil {
+                if connectedPeripheralTuple.canWriteWithoutResponse == nil && !retryWithResponse {
                     self.send(value: value, retryWithResponse: true, success: success, failure: failure)
                 } else {
                     print(error.localizedDescription)
-                    failure(.writeError(description: error.localizedDescription))
+                    failure(.underlying(error: error as NSError, fallback: .writeError(description: error.localizedDescription)))
                 }
             }
         }
     }
-    
-    public func disconnect(completion: OptionalBleErrorResponse?) {
-        guard isConnected else { completion?(nil); return }
-        guard !isExchanging else { self.waitingToDisconnectCompletion = completion; return }
-        self.bleModule.disconnect { [weak self] result in
-            switch result {
-            case .disconnected(_):
-                self?.connectedPeripheral = nil
-                completion?(nil)
-                self?.waitingToDisconnectCompletion = nil
-            case .failure(let error):
-                completion?(.lowerLevelError(description: error.localizedDescription))
-                self?.waitingToDisconnectCompletion = nil
+
+    public func abortExchange() {
+        DispatchQueue.main.async {
+            guard self.pendingExchange != nil, !self.abortingExchange else { return }
+            self.abortingExchange = true
+            self.connectionUsable = false
+            self.connectionGeneration += 1
+            if self.isConnected {
+                self.bleModule.cancelConnection()
+            } else {
+                self.clearConnection()
             }
         }
     }
-    
-    public func connect(toPeripheralID peripheral: PeripheralIdentifier, disconnectedCallback: EmptyResponse?, success: @escaping PeripheralResponse, failure: @escaping BleErrorResponse) {
-        
-        guard !isConnected else { failure(.connectError(description: "Already connected to a peripheral")); return }
-        guard isBluetoothAvailable else { failure(.bluetoothNotAvailable); return }
-        
-        self.stopScanning()
-        
-        self.disconnectedCallback = disconnectedCallback
-        
-        let connect = createConnectFunction(success: success, failure: failure)
-        
-        if let p = peripheralsServicesTuple.first(where: { $0.peripheral == peripheral }) {
-            connect(p.peripheral)
-        } else {
-            scanAndDiscoverBeforeConnecting(lookingFor: peripheral, connectFunction: connect, failure: failure)
+
+    public func disconnect(completion: OptionalBleErrorResponse?) {
+        guard !disconnecting else { completion?(.pendingActionOnDevice); return }
+        guard isConnected else { completion?(nil); return }
+        guard !isExchanging else { self.waitingToDisconnectCompletion = completion; return }
+        disconnecting = true
+        disconnectCompletion = completion
+        connectionUsable = false
+        startPhysicalDisconnect()
+    }
+
+    private func startPhysicalDisconnect() {
+        self.bleModule.disconnect { [weak self] result in
+            guard let self else { return }
+            if case .failure(let error) = result {
+                let callback = self.disconnectCompletion
+                self.disconnectCompletion = nil
+                self.disconnecting = false
+                callback?(.underlying(error: error as NSError, fallback: .lowerLevelError(description: error.localizedDescription)))
+            }
+            // Success completes in clearConnection, after the module queue and
+            // notifications have drained. Never reconnect ahead of that event.
         }
     }
-    
-    public func connect(toPeripheralNamed name: String, disconnectedCallback: EmptyResponse?, success: @escaping PeripheralResponse, failure: @escaping BleErrorResponse) {
-        
+
+    public func connect(toPeripheralID peripheral: PeripheralIdentifier, disconnectedCallback: DisconnectionResponse?, success: @escaping PeripheralResponse, failure: @escaping BleErrorResponse) {
+
+        guard connectSuccess == nil && !disconnecting else { failure(.pendingActionOnDevice); return }
         guard !isConnected else { failure(.connectError(description: "Already connected to a peripheral")); return }
         guard isBluetoothAvailable else { failure(.bluetoothNotAvailable); return }
-        
+
         self.stopScanning()
-        
+
         self.disconnectedCallback = disconnectedCallback
-        
-        let connect = createConnectFunction(success: success, failure: failure)
-        
-        if let p = peripheralsServicesTuple.first(where: { $0.peripheral.name == name }) {
-            connect(p.peripheral)
+        connectionGeneration += 1
+        let generation = connectionGeneration
+        connectSuccess = success
+        connectFailure = failure
+        connectionUsable = false
+
+        let connect = {
+            self.bleModule.connectLedger(peripheral, timeout: .seconds(5)) { [weak self] result in
+                guard let self = self else { return }
+                guard generation == self.connectionGeneration, self.connectSuccess != nil else { return }
+                switch result {
+                case .success(let peripheral):
+                    self.connectedPeripheral = peripheral
+                    // Includes notification setup (which may prompt pairing).
+                    self.handshakeTimer = Timer.scheduledTimer(withTimeInterval: self.handshakeTimeout, repeats: false) { [weak self] _ in
+                        guard let self, generation == self.connectionGeneration else { return }
+                        self.failConnect(.connectError(description: "Ledger Bluetooth initialization timed out"))
+                    }
+                    self.startListening {
+                        guard generation == self.connectionGeneration, self.connectSuccess != nil else { return }
+                        self.mtuWaitingForCallback = { [weak self] connected in
+                            guard let self, generation == self.connectionGeneration else { return }
+                            self.handshakeTimer?.invalidate()
+                            self.handshakeTimer = nil
+                            let completion = self.connectSuccess
+                            self.connectSuccess = nil
+                            self.connectFailure = nil
+                            self.mtuWaitingForCallback = nil
+                            self.connectionUsable = true
+                            completion?(connected)
+                        }
+                        self.inferMTU()
+                    }
+                case .failure(let error):
+                    if case ConnectionError.timedOut = error { self.disconnecting = true }
+                    self.failConnect(.underlying(error: error as NSError, fallback: .connectError(description: error.localizedDescription)))
+                }
+            }
+        }
+
+        if !peripheralsServicesTuple.contains(where: { $0.peripheral == peripheral }) {
+            scanAndDiscoverBeforeConnecting(matching: { $0.peripheral == peripheral }, connectFunction: { [weak self] _ in
+                guard let self, generation == self.connectionGeneration, self.connectSuccess != nil else { return }
+                connect()
+            }, failure: { [weak self] error in
+                guard let self, generation == self.connectionGeneration, self.connectSuccess != nil else { return }
+                self.failConnect(error)
+            })
         } else {
-            scanAndDiscoverBeforeConnecting(lookingFor: name, connectFunction: connect, failure: failure)
+            connect()
         }
     }
-        
+
+    public func connect(toPeripheralNamed name: String, disconnectedCallback: DisconnectionResponse?, success: @escaping PeripheralResponse, failure: @escaping BleErrorResponse) {
+        guard connectSuccess == nil && !disconnecting else { failure(.pendingActionOnDevice); return }
+        guard !isConnected else { failure(.connectError(description: "Already connected to a peripheral")); return }
+        guard isBluetoothAvailable else { failure(.bluetoothNotAvailable); return }
+        stopScanning()
+
+        if let peripheral = peripheralsServicesTuple.first(where: { $0.peripheral.name == name })?.peripheral {
+            connect(toPeripheralID: peripheral, disconnectedCallback: disconnectedCallback, success: success, failure: failure)
+        } else {
+            scanAndDiscoverBeforeConnecting(matching: { $0.peripheral.name == name }, connectFunction: { [weak self] peripheral in
+                self?.connect(toPeripheralID: peripheral, disconnectedCallback: disconnectedCallback, success: success, failure: failure)
+            }, failure: failure)
+        }
+    }
+
     public func bluetoothAvailabilityCallback(completion: @escaping ((Bool)->())) {
         completion(isBluetoothAvailable)
         bluetoothAvailabilityCompletion = completion
     }
-    
+
     public func bluetoothStateCallback(completion: @escaping ((CBManagerState)->())) {
         completion(self.bleModule.bluetoothState)
         bluetoothStateCompletion = completion
     }
-    
+
     public func notifyDisconnected(completion: @escaping EmptyResponse) {
         if !isConnected {
             completion()
@@ -290,7 +405,7 @@ extension BleTransport: BleModuleDelegate {
             notifyDisconnectedCompletion = completion
         }
     }
-    
+
     public func getAppAndVersion(success: @escaping ((AppInfo)->()), failure: @escaping ErrorResponse) {
         let apdu = APDU(data: [0xb0, 0x01, 0x00, 0x00])
         exchange(apdu: apdu) { result in
@@ -320,7 +435,7 @@ extension BleTransport: BleModuleDelegate {
             }
         }
     }
-    
+
     public func openAppIfNeeded(_ name: String, completion: @escaping (Result<Void, Error>) -> Void) {
         Task() {
             do {
@@ -342,10 +457,10 @@ extension BleTransport: BleModuleDelegate {
             }
         }
     }
-    
-    
+
+
     // MARK: - Private methods
-    
+
     /// Updates the current list of peripherals matching them with their service.
     ///
     /// - Parameter discoveries: All the current peripherals.
@@ -358,127 +473,89 @@ extension BleTransport: BleModuleDelegate {
                 auxPeripherals.append(PeripheralInfo(peripheral: discovery.peripheralIdentifier, rssi: discovery.rssi, serviceUUID: firstService, canWriteWithoutResponse: nil))
             }
         }
-        
+
         let somethingChanged = auxPeripherals.map({ $0.peripheral }) != peripheralsServicesTuple.map({ $0.peripheral })
-        
+
         peripheralsServicesTuple = auxPeripherals
-        
+
         return somethingChanged
     }
-    
-    fileprivate func scanAndDiscoverBeforeConnecting(lookingFor identifier: PeripheralIdentifier, connectFunction: @escaping ConnectFunction, failure: @escaping BleErrorResponse) {
-        scan(validationBlock: { $0.peripheral == identifier }, connectFunction: connectFunction, failure: failure)
-    }
-    
-    fileprivate func scanAndDiscoverBeforeConnecting(lookingFor name: String, connectFunction: @escaping ConnectFunction, failure: @escaping BleErrorResponse) {
-        scan(validationBlock: { $0.peripheral.name == name }, connectFunction: connectFunction, failure: failure)
-    }
-    
-    fileprivate func scan(validationBlock predicate: @escaping (PeripheralInfo) -> Bool, connectFunction: @escaping ConnectFunction, failure: @escaping BleErrorResponse) {
-        DispatchQueue.main.async {
+
+    fileprivate func scanAndDiscoverBeforeConnecting(matching predicate: @escaping (PeripheralInfo) -> Bool, connectFunction: @escaping (PeripheralIdentifier) -> Void, failure: @escaping BleErrorResponse) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            var finished = false
             let timer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { _ in
+                guard !finished else { return }
+                finished = true
                 self.stopScanning()
                 failure(.connectError(description: "Couldn't find peripheral when scanning, timed out"))
             }
-            
+
             self.scan(duration: self.scanDuration) { [weak self] discoveries in
-                if let p = discoveries.first(where: { predicate($0) }) {
+                if !finished, let peripheral = discoveries.first(where: predicate)?.peripheral {
+                    finished = true
                     timer.invalidate()
-                    connectFunction(p.peripheral)
                     self?.stopScanning()
+                    connectFunction(peripheral)
                 }
             } stopped: { error in
-                if let error = error {
+                if let error = error, !finished {
+                    finished = true
+                    timer.invalidate()
                     failure(.connectError(description: "Couldn't find peripheral when scanning because of error: \(error.localizedDescription)"))
                 }
             }
         }
     }
-    
+
     fileprivate func currentConnectedTuple() -> Result<(PeripheralIdentifier, PeripheralInfo, BleService), BleTransportError> {
         guard let connectedPeripheral = connectedPeripheral else { return .failure(.currentConnectedError(description: "Not connected")) }
         guard let connectedPeripheralTuple = peripheralsServicesTuple.first(where: { $0.peripheral.uuid == connectedPeripheral.uuid }) else { return .failure(.currentConnectedError(description: "peripheralsServiceTuple doesn't contain connected peripheral UUID")) }
         guard let peripheralService = configuration.serviceMatching(serviceUUID: connectedPeripheralTuple.serviceUUID) else { return .failure(.currentConnectedError(description: "No matching peripheralService")) }
-        
+
         return .success((connectedPeripheral, connectedPeripheralTuple, peripheralService))
     }
-    
+
     /**
      * Write the next ble frame to the peripheral, only triggered from the exchange/send methods.
      **/
     fileprivate func writeAPDU(_ apdu: APDU, withResponse: Bool = false) {
+        guard let pending = pendingExchange else { return }
         guard !apdu.isEmpty else {
-            self.exchangeCallback?(.failure(.writeError(description: "APDU is empty")))
-            self.exchangeCallback = nil
+            finishExchange(.failure(.writeError(description: "APDU is empty")))
             return
         }
-        
-        send(apdu: apdu) {
+        send(apdu: apdu) { [weak self, weak pending] in
+            guard let self, let pending, !self.abortingExchange, self.pendingExchange === pending else { return }
             apdu.next()
-            if !apdu.isEmpty {
-                self.writeAPDU(apdu)
-            }
-        } failure: { error in
-            self.isExchanging = false
-            self.exchangeCallback?(.failure(.writeError(description: error.localizedDescription)))
-            self.exchangeCallback = nil
+            if !apdu.isEmpty { self.writeAPDU(apdu) }
+        } failure: { [weak self, weak pending] error in
+            guard let self, let pending, !self.abortingExchange, self.pendingExchange === pending else { return }
+            self.finishExchange(.failure(error))
         }
-        
     }
-    
+
     fileprivate func startListening(setupFinished: EmptyResponse?) {
+        let generation = connectionGeneration
         self.listen { [weak self] apduReceived in
-            guard let self = self else { return }
+            guard let self, generation == self.connectionGeneration else { return }
             if self.mtuWaitingForCallback != nil {
                 self.parseMTUresponse(apduReceived: apduReceived)
-                self.mtuWaitingForCallback = nil
                 return
             }
-            /// This might be a partial response
-            var offset = 6
-            let hex = apduReceived.data.hexEncodedString()
-            
-            if self.currentResponse == "" {
-                offset = 10
-                
-                let a = hex.index(hex.startIndex, offsetBy: 6)
-                let b = hex.index(hex.startIndex, offsetBy: 10)
-                let expectedLength = (Int(hex[a..<b], radix: 16) ?? 1) * 2
-                self.currentResponseRemainingLength = expectedLength
-                print("Expected length is: \(expectedLength)")
-            }
-            
-            let cleanAPDU = hex.suffix(hex.count - offset)
-            
-            self.currentResponse += cleanAPDU
-            self.currentResponseRemainingLength -= cleanAPDU.count
-            
-            print("Received: \(cleanAPDU)")
-            
-            if self.currentResponseRemainingLength <= 0 {
-                /// We got the full response in `currentResponse`
-                self.isExchanging = false
-                self.exchangeCallback?(.success(self.currentResponse))
-                self.exchangeCallback = nil
-                self.currentResponse = ""
-                self.currentResponseRemainingLength = 0
-            } else {
-                print("WAITING_FOR_NEXT_MESSAGE!!")
-            }
-        } setupFinished: {
+            guard let pending = self.pendingExchange else { return }
+            if let result = pending.receive(apduReceived.data) { self.finishExchange(result) }
+        } setupFinished: { [weak self] in
+            guard let self, generation == self.connectionGeneration else { return }
             setupFinished?()
         } failure: { [weak self] error in
-            if case .pairingError = error {
-                self?.connectFailure?(error)
-                self?.disconnect(completion: nil)
-            } else {
-                self?.exchangeCallback?(.failure(error))
-                self?.exchangeCallback = nil
-            }
-            self?.isExchanging = false
+            guard let self, generation == self.connectionGeneration else { return }
+            if self.connectSuccess != nil { self.failConnect(error) }
+            else { self.finishExchange(.failure(error)) }
         }
     }
-    
+
     fileprivate func listen(apduReceived: @escaping APDUResponse, setupFinished: EmptyResponse?, failure: @escaping BleErrorResponse) {
         let peripheralService: BleService
         let currentConnectedTuple = currentConnectedTuple()
@@ -494,44 +571,65 @@ extension BleTransport: BleModuleDelegate {
             case .success(let apdu):
                 apduReceived(apdu)
             case .failure(let error):
-                if (error as NSError).code == CBATTError.insufficientEncryption.rawValue {
-                    failure(.pairingError(description: error.localizedDescription))
+                if (error as NSError).domain == CBATTErrorDomain &&
+                    (error as NSError).code == CBATTError.insufficientEncryption.rawValue {
+                    failure(.underlying(error: error as NSError, fallback: .pairingError(description: error.localizedDescription)))
                 } else {
-                    failure(.listenError(description: error.localizedDescription))
+                    failure(.underlying(error: error as NSError, fallback: .listenError(description: error.localizedDescription)))
                 }
             }
         } setupFinished: {
             setupFinished?()
         }
     }
-    
+
     fileprivate func inferMTU() {
-        send(value: APDU.inferMTU) {
-            
-        } failure: { error in
-            print("Error inferring MTU: \(error.localizedDescription)")
+        send(value: APDU.inferMTU) {} failure: { [weak self] error in
+            self?.failConnect(error)
         }
     }
-    
+
     fileprivate func parseMTUresponse(apduReceived: APDU) {
-        if apduReceived.data.first == 0x08 {
-            if let fifthByte = apduReceived.data.advanced(by: 5).first {
-                APDU.mtuSize = Int(fifthByte)
-            }
+        guard apduReceived.data.count >= 6, apduReceived.data.first == 0x08,
+              apduReceived.data[5] > 5 else {
+            failConnect(.connectError(description: "Invalid Ledger MTU response"))
+            return
         }
-        if let connectedPeripheral = connectedPeripheral {
-            mtuWaitingForCallback?(connectedPeripheral)
-        }
+        APDU.mtuSize = Int(apduReceived.data[5])
+        let completion = mtuWaitingForCallback
+        mtuWaitingForCallback = nil
+        if let connectedPeripheral { completion?(connectedPeripheral) }
     }
-    
-    fileprivate func clearConnection() {
+
+    fileprivate func clearConnection(error: Error? = nil) {
+        abortingExchange = false
+        connectionGeneration += 1
         connectedPeripheral = nil
-        isExchanging = false
-        notifyDisconnectedCompletion?()
-        notifyDisconnectedCompletion = nil /// We call `notifyDisconnectedCompletion` only once since it's used to be notified about the next disconnection not all of them
-        disconnectedCallback?()
+        connectionUsable = false
+        handshakeTimer?.invalidate()
+        handshakeTimer = nil
+        let connectError = connectFailure
+        let pendingConnectFailure = pendingConnectFailure
+        connectFailure = nil
+        self.pendingConnectFailure = nil
+        connectSuccess = nil
+        mtuWaitingForCallback = nil
+        let notify = notifyDisconnectedCompletion
+        notifyDisconnectedCompletion = nil
+        let disconnected = disconnectedCallback
+        let disconnectedResult = disconnectCompletion
+        disconnectCompletion = nil
+        disconnecting = false
+        // Release SDK ownership and buffers before any reentrant client callback.
+        let exchangeFailure = BleTransportError.currentConnectedError(description: "Ledger disconnected")
+        let connectionFailure = BleTransportError.connectError(description: "Ledger disconnected during initialization")
+        finishExchange(.failure(error.map { .underlying(error: $0 as NSError, fallback: exchangeFailure) } ?? exchangeFailure))
+        connectError?(pendingConnectFailure ?? error.map { .underlying(error: $0 as NSError, fallback: connectionFailure) } ?? connectionFailure)
+        notify?()
+        disconnected?(error)
+        disconnectedResult?(nil)
     }
-    
+
     fileprivate func openApp(_ name: String, success: @escaping EmptyResponse, failure: @escaping ErrorResponse) {
         let errorCodes: [BleStatusError: [String]] = [.userRejected(status: ""): ["6985", "5501"], .appNotAvailableInDevice(status: ""): ["6984", "6807"]]
         let nameData = Data(name.utf8)
@@ -548,11 +646,11 @@ extension BleTransport: BleModuleDelegate {
             failure(error)
             return
         }
-        
+
         BleTransport.shared.exchange(apdu: apdu) { [weak self] result in
             guard let self = self else { failure(BleTransportError.lowerLevelError(description: "closeApp -> self is nil")); return }
             guard let disconnectedCallback = self.disconnectedCallback else { failure(BleTransportError.lowerLevelError(description: "closeApp -> disconnectedCallback is nil")); return }
-            
+
             switch result {
             case .success(let response):
                 if let error = self.parseStatus(response: response, errorCodes: errorCodes) {
@@ -571,11 +669,11 @@ extension BleTransport: BleModuleDelegate {
             }
         }
     }
-    
+
     /// Never call this method directly since some apps (like Bitcoin) will hang the execution if `getAppAndVersion` is not called right before
     fileprivate func closeApp(success: @escaping EmptyResponse, failure: @escaping ErrorResponse) {
         let apdu = APDU(data: [0xb0, 0xa7, 0x00, 0x00])
-        
+
         let connectedPeripheral: PeripheralIdentifier
         switch currentConnectedTuple() {
         case .success(let tuple):
@@ -584,11 +682,11 @@ extension BleTransport: BleModuleDelegate {
             failure(error)
             return
         }
-        
+
         BleTransport.shared.exchange(apdu: apdu) { [weak self] result in
             guard let self = self else { failure(BleTransportError.lowerLevelError(description: "closeApp -> self is nil")); return }
             guard let disconnectedCallback = self.disconnectedCallback else { failure(BleTransportError.lowerLevelError(description: "closeApp -> disconnectedCallback is nil")); return }
-            
+
             switch result {
             case .success(_):
                 self.notifyDisconnected {
@@ -603,7 +701,7 @@ extension BleTransport: BleModuleDelegate {
             }
         }
     }
-    
+
     fileprivate func parseStatus(response: String, errorCodes: [BleStatusError: [String]]) -> BleStatusError? {
         let status = String(response.suffix(4))
         if status.count == 4 {
@@ -634,25 +732,7 @@ extension BleTransport: BleModuleDelegate {
             return .noStatus
         }
     }
-    
-    private func createConnectFunction(success: @escaping PeripheralResponse, failure: @escaping BleErrorResponse) -> ConnectFunction {
-        return { (peripheral: PeripheralIdentifier) in
-            self.bleModule.connect(peripheralIdentifier: peripheral, timeout: .seconds(5)) { [weak self] result in
-                guard let self = self else { return }
-                switch result {
-                case .success(let peripheral):
-                    self.connectedPeripheral = PeripheralIdentifier(uuid: peripheral.identifier, name: peripheral.name)
-                    self.connectFailure = failure
-                    self.startListening {
-                        self.mtuWaitingForCallback = success
-                        self.inferMTU()
-                    }
-                case .failure(let error):
-                    failure(.connectError(description: error.localizedDescription))
-                }
-            }
-        }
-    }
+
 }
 
 /// Async implementations
@@ -664,7 +744,7 @@ extension BleTransport {
             }
         }
     }
-    
+
     public func scan(duration: TimeInterval) -> AsyncThrowingStream<[PeripheralInfo], Error> {
         return AsyncThrowingStream { continuation in
             BleTransport.shared.scan(duration: duration) { devices in
@@ -678,15 +758,15 @@ extension BleTransport {
             }
         }
     }
-    
+
     @discardableResult
-    public func create(scanDuration: TimeInterval, disconnectedCallback: EmptyResponse?) async throws -> PeripheralIdentifier {
+    public func create(scanDuration: TimeInterval, disconnectedCallback: DisconnectionResponse?) async throws -> PeripheralIdentifier {
         let lock = NSLock()
         return try await withCheckedThrowingContinuation { continuation in
-            
+
             // https://forums.swift.org/t/how-to-prevent-swift-task-continuation-misuse/57581
             var nillableContinuation: CheckedContinuation<PeripheralIdentifier, Error>? = continuation
-            
+
             create(scanDuration: scanDuration, disconnectedCallback: disconnectedCallback) { response in
                 lock.lock()
                 defer { lock.unlock() }
@@ -695,7 +775,7 @@ extension BleTransport {
             } failure: { error in
                 lock.lock()
                 defer { lock.unlock() }
-                
+
                 nillableContinuation?.resume(throwing: error)
                 nillableContinuation = nil
             }
@@ -703,13 +783,13 @@ extension BleTransport {
         }
     }
     @discardableResult
-    public func connect(toPeripheralID: PeripheralIdentifier, disconnectedCallback: EmptyResponse?) async throws -> PeripheralIdentifier {
+    public func connect(toPeripheralID: PeripheralIdentifier, disconnectedCallback: DisconnectionResponse?) async throws -> PeripheralIdentifier {
         let lock = NSLock()
         return try await withCheckedThrowingContinuation { continuation in
-            
+
             // https://forums.swift.org/t/how-to-prevent-swift-task-continuation-misuse/57581
             var nillableContinuation: CheckedContinuation<PeripheralIdentifier, Error>? = continuation
-            
+
             connect(toPeripheralID: toPeripheralID, disconnectedCallback: disconnectedCallback) { response in
                 lock.lock()
                 defer { lock.unlock() }
@@ -721,16 +801,16 @@ extension BleTransport {
                 nillableContinuation?.resume(throwing: error)
                 nillableContinuation = nil
             }
-            
+
         }
     }
-    
-    public func connect(toPeripheralNamed name: String, disconnectedCallback: EmptyResponse?) async throws -> PeripheralIdentifier {
+
+    public func connect(toPeripheralNamed name: String, disconnectedCallback: DisconnectionResponse?) async throws -> PeripheralIdentifier {
         let lock = NSLock()
         return try await withCheckedThrowingContinuation { continuation in
-            
+
             var nillableContinuation: CheckedContinuation<PeripheralIdentifier, Error>? = continuation
-            
+
             connect(toPeripheralNamed: name, disconnectedCallback: disconnectedCallback) { response in
                 lock.lock()
                 defer { lock.unlock() }
@@ -742,10 +822,10 @@ extension BleTransport {
                 nillableContinuation?.resume(throwing: error)
                 nillableContinuation = nil
             }
-            
+
         }
     }
-    
+
     public func exchange(apdu apduToSend: APDU) async throws -> String {
         return try await withCheckedThrowingContinuation { continuation in
             exchange(apdu: apduToSend) { result in
@@ -765,16 +845,16 @@ extension BleTransport {
             } failure: { error in
                 continuation.resume(throwing: error)
             }
-            
+
         }
     }
     public func disconnect() async throws {
         let lock = NSLock()
         return try await withCheckedThrowingContinuation { continuation in
-            
+
             // https://forums.swift.org/t/how-to-prevent-swift-task-continuation-misuse/57581
             var nillableContinuation: CheckedContinuation<Void, Error>? = continuation
-            
+
             disconnect() { error in
                 if let error = error {
                     lock.lock()
@@ -815,7 +895,7 @@ extension BleTransport {
         let lock = NSLock()
         return try await withCheckedThrowingContinuation { continuation in
             var nillableContinuation: CheckedContinuation<Void, Error>? = continuation
-            
+
             openApp(name) {
                 lock.lock()
                 defer { lock.unlock() }

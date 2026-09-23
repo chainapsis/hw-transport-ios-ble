@@ -1,6 +1,6 @@
 //
 //  PeripheralIdentifier.swift
-//  
+//
 //
 //  Created by Dante Puglisi on 8/2/22.
 //
@@ -12,15 +12,15 @@ import CoreBluetooth
 public struct PeripheralIdentifier {
     /// The UUID of the peripheral.
     public let uuid: UUID
-    
+
     /// The name of the peripheral.
     public let name: String
-    
+
     /// Returns both the name and uuid of the peripheral.
     public var description: String {
         return "Peripheral: \(name), UUID: \(uuid)"
     }
-    
+
     /// Create a PeripheralIdentifier using a UUID.
     public init(uuid: UUID, name: String?) {
         self.uuid = uuid

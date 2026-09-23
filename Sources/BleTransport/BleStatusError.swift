@@ -1,6 +1,6 @@
 //
 //  BleStatusError.swift
-//  
+//
 //
 //  Created by Harrison on 1/13/23.
 //
@@ -15,7 +15,7 @@ public enum BleStatusError: LocalizedError, Hashable {
     case couldNotParseResponseData(status: String)
     case unknown(status: String)
     case noStatus
-    
+
     public var errorDescription: String? {
         switch self {
         case .userRejected(_):
@@ -32,7 +32,7 @@ public enum BleStatusError: LocalizedError, Hashable {
             return "No status received from device"
         }
     }
-    
+
     public var status: String? {
         switch self {
         case .userRejected(let status):

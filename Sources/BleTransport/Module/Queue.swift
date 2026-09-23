@@ -10,17 +10,22 @@ import CoreBluetooth
 
 class Queue {
     var queue = [TaskOperation]()
-    
+
     var isEmpty: Bool {
         queue.isEmpty
     }
-    
+
     var first: TaskOperation? {
         queue.first
     }
-    
-    func add(_ operation: TaskOperation, finished: EmptyResponse? = nil) {
+
+    func add(_ operation: TaskOperation, isCurrent: @escaping () -> Bool = { true }, rejected: EmptyResponse? = nil, finished: EmptyResponse? = nil) {
         DispatchQueue.main.async {
+            guard isCurrent() else {
+                if let rejected { rejected() } else { operation.discard() }
+                finished?()
+                return
+            }
             self.queue.append(operation)
             if self.queue.count == 1 {
                 self.queue.first?.start()
@@ -28,7 +33,7 @@ class Queue {
             finished?()
         }
     }
-    
+
     func next(finished: EmptyResponse? = nil) {
         DispatchQueue.main.async {
             if !self.isEmpty {
@@ -38,27 +43,41 @@ class Queue {
             finished?()
         }
     }
-    
+
+    func finish(_ operation: TaskOperation) {
+        guard let index = queue.firstIndex(where: { $0 === operation }) else { return }
+        if index == 0 {
+            next()
+        } else {
+            queue.remove(at: index)
+        }
+    }
+
     func operationsOfType<T: TaskOperation>(_ operationType: T.Type) -> [T] {
         queue.filter({ type(of: $0) == operationType }) as! [T]
     }
-    
+
+    // Called on main before publishing an unavailable radio state.
+    func discardAll() {
+        queue.forEach { $0.discard() }
+        queue.removeAll()
+    }
+
     func removeAll(finished: EmptyResponse? = nil) {
         DispatchQueue.main.async {
-            self.queue.forEach({ $0.finished = nil })
-            self.queue.removeAll()
+            self.discardAll()
             finished?()
         }
     }
-    
+
     func removeAllUpToScanOrConnect(finished: EmptyResponse? = nil) {
         DispatchQueue.main.async {
-            guard let currentOperation = self.queue.first else { return }
+            guard let currentOperation = self.queue.first else { finished?(); return }
             if let firstOperationOfTypeIndex = self.queue.firstIndex(where: { type(of: $0) == Connect.self || type(of: $0) == Scan.self }) {
                 var newQueue = [TaskOperation]()
                 for (index, operation) in self.queue.enumerated() {
                     if index < firstOperationOfTypeIndex {
-                        operation.finished = nil
+                        operation.discard()
                     } else {
                         newQueue.append(operation)
                     }
