@@ -15,8 +15,8 @@ radio teardown, cancels late successes, and consumes callbacks once. Failed
 peripheral lookup also completes the queue instead of starting a nil peripheral.
 Discovery continuations and notification delegates are detached on disconnect.
 
-Validation: `swift test --package-path third_party/ledger_ble_transport` and
-`python3 scripts/test-ledger-apple.py`. The former injects only the radio boundary
+Validation: `swift test` in this fork and `python3 scripts/test-ledger-apple.py`
+in Vizor. The former injects only the radio boundary
 and executes this package's production framing, handshake and connection queue
 logic. The latter runs the shared iOS/macOS handler against controlled callbacks.
 
@@ -40,7 +40,7 @@ Apple handler maps confirmed CBError.peerRemovedPairingInformation to
 pairing_invalid, independent of localized text and callback ordering. Explicit
 cancellation, nil-error app switching and once-only draining retain their behavior.
 This fork's DisconnectionResponse callback signature differs from upstream; preserve
-it and its callers when updating this vendored package.
+it and its callers when updating this fork.
 
 Device discovery: add the official Flex and Nano Gen5 normal-mode BLE service
 and characteristic UUIDs. The upstream repository is archived, so this fork's
