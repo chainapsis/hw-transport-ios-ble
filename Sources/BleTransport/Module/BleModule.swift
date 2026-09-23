@@ -70,10 +70,8 @@ public class BleModule: NSObject {
 
     private func addOperation(_ operation: TaskOperation) {
         operation.finished = { [weak self] in
-            if let first = self?.operationsQueue.first, first === operation {
-                operation.finished = nil
-                self?.operationsQueue.next()
-            }
+            operation.finished = nil
+            self?.operationsQueue.finish(operation)
         }
         let generation = connectionGeneration
         self.operationsQueue.add(operation, isCurrent: { [weak self] in

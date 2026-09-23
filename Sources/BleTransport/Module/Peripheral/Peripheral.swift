@@ -15,9 +15,17 @@ public class Peripheral: NSObject {
 
     private var discoveries: [UUID: (DiscoveryResult) -> Void] = [:]
 
+    // CoreBluetooth uses the main queue; async preparation may resume elsewhere.
+    // Keep discovery registration, completion, and invalidation on that thread.
+    private func onMain(_ work: @escaping () -> Void) {
+        if Thread.isMainThread { work() }
+        else { DispatchQueue.main.async(execute: work) }
+    }
+
     // Release suspended discovery Tasks and detach callbacks before reusing the
     // CoreBluetooth peripheral for another connection.
     func invalidate() {
+        precondition(Thread.isMainThread)
         delegate = nil
         if cbPeripheral.delegate === self { cbPeripheral.delegate = nil }
         listeners.removeAll()
@@ -80,23 +88,31 @@ public class Peripheral: NSObject {
     }
 
     private func discoverService(_ serviceIdentifier: ServiceIdentifier, callback: @escaping (DiscoveryResult) -> Void) {
-        guard let delegate = delegate else { callback(.failure(BleModuleError.notConnected)); return }
-        let id = UUID()
-        discoveries[id] = callback
-        let operation = DiscoverService(serviceIdentifier: serviceIdentifier, peripheral: cbPeripheral) { [weak self] result in
-            self?.discoveries.removeValue(forKey: id)?(result)
+        onMain { [weak self] in
+            guard let self, let delegate = self.delegate else { callback(.failure(BleModuleError.notConnected)); return }
+            let id = UUID()
+            self.discoveries[id] = callback
+            let operation = DiscoverService(serviceIdentifier: serviceIdentifier, peripheral: self.cbPeripheral) { [weak self] result in
+                self?.onMain { [weak self] in
+                    self?.discoveries.removeValue(forKey: id)?(result)
+                }
+            }
+            delegate.requestStartOperation(operation)
         }
-        delegate.requestStartOperation(operation)
     }
 
     private func discoverCharacteristic(_ characteristicIdentifier: CharacteristicIdentifier, callback: @escaping (DiscoveryResult) -> Void) {
-        guard let delegate = delegate else { callback(.failure(BleModuleError.notConnected)); return }
-        let id = UUID()
-        discoveries[id] = callback
-        let operation = DiscoverCharacteristic(characteristicIdentifier: characteristicIdentifier, peripheral: cbPeripheral) { [weak self] result in
-            self?.discoveries.removeValue(forKey: id)?(result)
+        onMain { [weak self] in
+            guard let self, let delegate = self.delegate else { callback(.failure(BleModuleError.notConnected)); return }
+            let id = UUID()
+            self.discoveries[id] = callback
+            let operation = DiscoverCharacteristic(characteristicIdentifier: characteristicIdentifier, peripheral: self.cbPeripheral) { [weak self] result in
+                self?.onMain { [weak self] in
+                    self?.discoveries.removeValue(forKey: id)?(result)
+                }
+            }
+            delegate.requestStartOperation(operation)
         }
-        delegate.requestStartOperation(operation)
     }
 
     public func isListening(to characteristicIdentifier: CharacteristicIdentifier) -> Bool {

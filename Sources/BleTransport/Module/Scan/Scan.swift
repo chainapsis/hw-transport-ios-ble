@@ -143,7 +143,7 @@ public class Scan: TaskOperation {
         }
     }
 
-    // Queue invalidation is silent: Bluetooth state already supplies the error.
+    // Ordinary queue invalidation is silent; radio loss uses discardReporting.
     // Mark terminal before stopping radio or releasing callbacks for reentrancy.
     func discard() {
         guard !isFinished else { finished = nil; return }

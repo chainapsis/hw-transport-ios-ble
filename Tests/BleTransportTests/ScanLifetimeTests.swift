@@ -159,6 +159,41 @@ final class ScanLifetimeTests: XCTestCase {
         XCTAssertEqual(radio.starts, 0)
         XCTAssertTrue(queue.isEmpty)
     }
+
+    @MainActor
+    func testStoppingQueuedScanLetsFollowingOperationRun() async {
+        let radio = ScanTestRadio()
+        let queue = Queue()
+        let blocker = QueueMarkerOperation()
+        let scanStopped = expectation(description: "queued scan stopped")
+        let scan = makeScan(radio, duration: 10) { scanStopped.fulfill() }
+        let followingStarted = expectation(description: "operation after scan started")
+        let following = QueueMarkerOperation { followingStarted.fulfill() }
+        blocker.finished = { queue.finish(blocker) }
+        scan.finished = { queue.finish(scan) }
+        let added = expectation(description: "all operations queued")
+        added.expectedFulfillmentCount = 3
+        queue.add(blocker) { added.fulfill() }
+        queue.add(scan) { added.fulfill() }
+        queue.add(following) { added.fulfill() }
+        await fulfillment(of: [added], timeout: 2)
+
+        scan.stopScanning()
+        await fulfillment(of: [scanStopped], timeout: 2)
+        XCTAssertEqual(queue.queue.count, 2)
+        XCTAssertEqual(radio.starts, 0)
+        blocker.finished?()
+        await fulfillment(of: [followingStarted], timeout: 2)
+        XCTAssertEqual(following.starts, 1)
+    }
+}
+
+private final class QueueMarkerOperation: TaskOperation {
+    var finished: EmptyResponse?
+    var starts = 0
+    let onStart: () -> Void
+    init(onStart: @escaping () -> Void = {}) { self.onStart = onStart }
+    func start() { starts += 1; onStart() }
 }
 
 private func makeScan(_ radio: ScanTestRadio, duration: TimeInterval, stopped: @escaping () -> Void = {}) -> Scan {

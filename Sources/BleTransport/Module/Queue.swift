@@ -44,6 +44,15 @@ class Queue {
         }
     }
 
+    func finish(_ operation: TaskOperation) {
+        guard let index = queue.firstIndex(where: { $0 === operation }) else { return }
+        if index == 0 {
+            next()
+        } else {
+            queue.remove(at: index)
+        }
+    }
+
     func operationsOfType<T: TaskOperation>(_ operationType: T.Type) -> [T] {
         queue.filter({ type(of: $0) == operationType }) as! [T]
     }
