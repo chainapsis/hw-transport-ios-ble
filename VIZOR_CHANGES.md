@@ -1,12 +1,15 @@
 # Vizor BLE transport patch
 
 Source: https://github.com/LedgerHQ/hw-transport-ios-ble
-Version: 1.0.1
-Revision: 4df8fff21c1738a1dff4d2ee19175dd3263d6c5f
+Base: upstream `main` at b601ebb92d087a58ec380060e28341abb624e75d
+Previous Vizor base: v1.0.1 at 4df8fff21c1738a1dff4d2ee19175dd3263d6c5f
 License: MIT (see LICENSE)
 
 Vizor's iOS and macOS runners and native test harness use a pinned commit of
 this fork.
+The upstream `main` merge retains its async scanning, name-based connection,
+error IDs, public app info, and continuation safeguards. Vizor's recovery
+semantics remain in the shared connection and exchange paths.
 Changes settle disconnected requests exactly once, clear response assembly,
 isolate connection generations and fail incomplete connection handshakes.
 

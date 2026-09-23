@@ -4,6 +4,18 @@ import CoreBluetooth
 
 final class RecoveryTests: XCTestCase {
     @MainActor
+    func testConnectByNameUsesRecoveredConnectionPath() async {
+        let radio = Radio()
+        let transport = BleTransport(configuration: nil, debugMode: false, module: radio)
+        let ready = expectation(description: "named device connected")
+        transport.connect(toPeripheralNamed: radio.device.name, disconnectedCallback: nil,
+                          success: { XCTAssertEqual($0, radio.device); ready.fulfill() },
+                          failure: { XCTFail("\($0)") })
+        await fulfillment(of: [ready], timeout: 2)
+        XCTAssertEqual(radio.connects, 1)
+    }
+
+    @MainActor
     private func connected(_ radio: Radio, timeout: TimeInterval = 60) async -> BleTransport {
         let transport = BleTransport(configuration: nil, debugMode: false, module: radio, handshakeTimeout: timeout)
         let ready = expectation(description: "connected")

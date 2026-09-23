@@ -23,7 +23,7 @@ class ViewController: NSViewController {
     
     fileprivate func create() {
         self.titleLabel.stringValue = "Looking for a device to connect to..."
-        BleTransport.shared.create(scanDuration: 5.0, disconnectedCallback: {
+        BleTransport.shared.create(scanDuration: 5.0, disconnectedCallback: { _ in
             print("Device disconnected!")
         }, success: { result in
             self.titleLabel.stringValue = "Connected to \(result.name)"
@@ -68,4 +68,3 @@ class ViewController: NSViewController {
         alert.runModal()
     }
 }
-

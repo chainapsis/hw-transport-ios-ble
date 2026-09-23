@@ -8,9 +8,8 @@
 import Foundation
 import CoreBluetooth
 
-public typealias PeripheralInfoTuple = (peripheral: PeripheralIdentifier, rssi: Int, serviceUUID: CBUUID, canWriteWithoutResponse: Bool?)
 public typealias PeripheralResponse = ((PeripheralIdentifier)->())
-public typealias PeripheralsWithServicesResponse = (([PeripheralInfoTuple])->())
+public typealias PeripheralsWithServicesResponse = (([PeripheralInfo])->())
 public typealias APDUResponse = ((APDU)->())
 /// Physical disconnect cause; nil for ordinary/app-switch disconnects.
 public typealias DisconnectionResponse = ((Error?)->())
@@ -32,6 +31,7 @@ public protocol BleTransportProtocol {
     ///
     /// - Parameter callback: Called each time the peripheral list of discovered peripherals changes.
     func scan(duration: TimeInterval, callback: @escaping PeripheralsWithServicesResponse, stopped: @escaping OptionalBleErrorResponse)
+    func scan(duration: TimeInterval) -> AsyncThrowingStream<[PeripheralInfo], Error>
 
     /// Stop scanning for reachable peripherals.
     ///
@@ -45,6 +45,10 @@ public protocol BleTransportProtocol {
     /// - Parameter peripheral: The peripheral to connect to.
     func connect(toPeripheralID peripheral: PeripheralIdentifier, disconnectedCallback: DisconnectionResponse?, success: @escaping PeripheralResponse, failure: @escaping BleErrorResponse)
     @discardableResult func connect(toPeripheralID peripheral: PeripheralIdentifier, disconnectedCallback: DisconnectionResponse?) async throws -> PeripheralIdentifier
+
+    /// Attempt to connect to a discovered peripheral by name.
+    func connect(toPeripheralNamed name: String, disconnectedCallback: DisconnectionResponse?, success: @escaping PeripheralResponse, failure: @escaping BleErrorResponse)
+    @discardableResult func connect(toPeripheralNamed name: String, disconnectedCallback: DisconnectionResponse?) async throws -> PeripheralIdentifier
 
     /// Convenience method to `scan` for peripherals and connecting to the first discovered one.
     /// - Parameters:
@@ -111,6 +115,6 @@ public protocol BleTransportProtocol {
 }
 
 public struct AppInfo {
-    let name: String
-    let version: String
+    public let name: String
+    public let version: String
 }
