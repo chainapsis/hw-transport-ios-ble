@@ -9,7 +9,7 @@ import Foundation
 
 public enum ReadError: LocalizedError {
     case missingData
-    
+
     public var errorDescription: String? {
         switch self {
         case .missingData:
@@ -27,7 +27,7 @@ public enum ReadResult<R> {
 }
 
 extension ReadResult where R: Receivable {
-    
+
     /// Create a typed read result from raw data.
     init(dataResult: ReadResult<Data?>) {
         switch dataResult {
@@ -45,5 +45,5 @@ extension ReadResult where R: Receivable {
             self = .failure(error)
         }
     }
-    
+
 }

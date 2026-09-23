@@ -1,6 +1,6 @@
 //
 //  ScanAction.swift
-//  
+//
 //
 //  Created by Dante Puglisi on 8/2/22.
 //

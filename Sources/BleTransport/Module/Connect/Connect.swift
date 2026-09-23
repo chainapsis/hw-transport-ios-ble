@@ -20,7 +20,7 @@ public enum ConnectionError: LocalizedError {
     case timedOut
     case unexpectedDisconnect
     case peripheralCantBeRetrievedFromCentralManager
-    
+
     public var errorDescription: String? {
         switch self {
         case .timedOut:
@@ -34,71 +34,79 @@ public enum ConnectionError: LocalizedError {
 }
 
 public class Connect: TaskOperation {
-    
     var finished: EmptyResponse?
-    
-    /// The peripheral this operation is for.
-    var peripheral: CBPeripheral! = nil
-    
-    /// The manager responsible for this operation.
-    let manager: CBCentralManager
-    
-    /// Callback for the connection attempt.
-    var callback: ((ConnectionResult) -> Void)?
-    
+    private(set) var peripheral: CBPeripheral?
+    private var callback: ((ConnectionResult) -> Void)?
     private var connectionTimer: Timer?
-    private let timeout: Timeout?
-    
-    init(peripheralIdentifier: PeripheralIdentifier, manager: CBCentralManager, timeout: Timeout, callback: @escaping (ConnectionResult) -> Void) {
-        
-        self.manager = manager
-        self.timeout = timeout
-        self.callback = callback
-        
-        guard let cbPeripheral = manager.retrievePeripherals(withIdentifiers: [peripheralIdentifier.uuid]).first else { complete(.failure(ConnectionError.peripheralCantBeRetrievedFromCentralManager)); return }
-        self.peripheral = cbPeripheral
+    private let timeout: Timeout
+    private let startConnection: () throws -> Void
+    private let cancelConnection: () -> Void
+    private var didTimeOut = false
+
+    convenience init(peripheralIdentifier: PeripheralIdentifier, manager: CBCentralManager, timeout: Timeout, callback: @escaping (ConnectionResult) -> Void) {
+        let peripheral = manager.retrievePeripherals(withIdentifiers: [peripheralIdentifier.uuid]).first
+        self.init(timeout: timeout, start: {
+            guard let peripheral else { throw ConnectionError.peripheralCantBeRetrievedFromCentralManager }
+            manager.connect(peripheral)
+        }, cancel: {
+            if let peripheral { manager.cancelPeripheralConnection(peripheral) }
+        }, callback: callback)
+        self.peripheral = peripheral
     }
-    
+
+    // Inject radio actions to exercise the real queue ownership without a radio.
+    init(timeout: Timeout, start: @escaping () throws -> Void, cancel: @escaping () -> Void, callback: @escaping (ConnectionResult) -> Void) {
+        self.timeout = timeout
+        self.startConnection = start
+        self.cancelConnection = cancel
+        self.callback = callback
+    }
+
     func start() {
-        manager.connect(peripheral)
-        
-        cancelTimer()
-        
-        if let timeOut = timeout, case let .seconds(timeoutInterval) = timeOut {
-            connectionTimer = Timer.scheduledTimer(withTimeInterval: timeoutInterval, repeats: false) { [weak self] _ in
-                guard let weakSelf = self else {
-                    return
-                }
-                
-                weakSelf.timedOut()
+        do { try startConnection() }
+        catch { complete(.failure(error)); return }
+        if case .seconds(let interval) = timeout {
+            connectionTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
+                self?.timedOut()
             }
         }
     }
-    
-    func complete(_ result: ConnectionResult) {
-        callback?(result)
+
+    private func complete(_ result: ConnectionResult) {
+        cancelTimer()
+        let completion = callback
         callback = nil
-        finished?()
+        completion?(result)
+        let drained = finished
+        finished = nil
+        drained?()
     }
-    
+
     func didConnectPeripheral() {
-        complete(.success(peripheral))
-    }
-    
-    func didDisconnectPeripheral(error: Error?) {
-        if let error = error {
-            complete(.failure(error))
-        } else {
-            complete(.failure(ConnectionError.unexpectedDisconnect))
+        if didTimeOut {
+            cancelConnection()
+        } else if let peripheral {
+            complete(.success(peripheral))
         }
     }
-    
+
+    func didDisconnectPeripheral(error: Error?) {
+        complete(.failure(error ?? ConnectionError.unexpectedDisconnect))
+    }
+
     private func cancelTimer() {
         connectionTimer?.invalidate()
         connectionTimer = nil
     }
-    
-    @objc private func timedOut() {
-        complete(.failure(ConnectionError.timedOut))
+
+    private func timedOut() {
+        didTimeOut = true
+        cancelTimer()
+        let completion = callback
+        callback = nil
+        completion?(.failure(ConnectionError.timedOut))
+        // Keep the queue slot until CoreBluetooth confirms teardown. A late
+        // didConnect belongs to this attempt and must never complete the next.
+        cancelConnection()
     }
 }

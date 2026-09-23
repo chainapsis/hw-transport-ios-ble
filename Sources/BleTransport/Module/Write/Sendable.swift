@@ -9,7 +9,7 @@ import Foundation
 
 /// Protocol to indicate that a type can be sent via the Bluetooth connection.
 public protocol Sendable {
-    
+
     /**
      A place to implement your serialization logic.
      */
