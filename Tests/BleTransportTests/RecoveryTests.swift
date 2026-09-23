@@ -211,6 +211,38 @@ final class RecoveryTests: XCTestCase {
     }
 
     @MainActor
+    func testQueuedDisconnectOwnsTeardownBeforeExchangeCallbackReenters() async {
+        let radio = Radio()
+        let transport = await connected(radio)
+        radio.deferDisconnect = true
+        let exchanged = expectation(description: "exchange returned")
+        let disconnected = expectation(description: "original disconnect returned")
+        var originalCompletions = 0
+        transport.exchange(apdu: APDU(data: [0xb0, 1, 0, 0])) { result in
+            XCTAssertEqual(try? result.get(), "9000")
+            transport.disconnect { error in
+                guard case .pendingActionOnDevice? = error else {
+                    XCTFail("reentrant disconnect took ownership")
+                    return
+                }
+            }
+            exchanged.fulfill()
+        }
+        await Task.yield()
+        transport.disconnect { error in
+            XCTAssertNil(error)
+            originalCompletions += 1
+            disconnected.fulfill()
+        }
+        radio.deliver([5, 0, 0, 0, 2, 0x90, 0])
+        await fulfillment(of: [exchanged], timeout: 2)
+        XCTAssertEqual(originalCompletions, 0)
+        radio.loseConnection()
+        await fulfillment(of: [disconnected], timeout: 2)
+        XCTAssertEqual(originalCompletions, 1)
+    }
+
+    @MainActor
     func testConnectTimeoutKeepsQueueUntilRadioDrains() async {
         let timedOut = expectation(description: "timeout returned")
         var results = 0
@@ -293,6 +325,31 @@ final class RecoveryTests: XCTestCase {
         queue.discardAll()
     }
 
+    @MainActor
+    func testModulePublishesConnectionFailureAfterCleanup() async {
+        let module = BleModule()
+        let notified = expectation(description: "cleanup published")
+        let retried = expectation(description: "retry was not discarded")
+        var events: [String] = []
+        let delegate = ModuleDelegateSpy {
+            events.append("delegate")
+            module.connect(peripheralIdentifier: PeripheralIdentifier(uuid: UUID(), name: "Retry"), timeout: .none) { result in
+                guard case .failure(ConnectionError.peripheralCantBeRetrievedFromCentralManager) = result else {
+                    XCTFail("retry did not reach the connection operation")
+                    return
+                }
+                retried.fulfill()
+            }
+            notified.fulfill()
+        }
+        module.start(delegate: delegate)
+        module.clearAfterDisconnect(from: PeripheralIdentifier(uuid: UUID(), name: "Ledger"), error: nil) {
+            events.append("old operation")
+        }
+        await fulfillment(of: [notified, retried], timeout: 2)
+        XCTAssertEqual(events, ["delegate", "old operation"])
+    }
+
     func testCompletionAndMalformedResponseAreBounded() {
         var callbacks = 0
         let pending = PendingBleExchange { _ in callbacks += 1 }
@@ -356,4 +413,12 @@ private final class TestOperation: TaskOperation {
     var finished: EmptyResponse?
     var starts = 0
     func start() { starts += 1 }
+}
+
+private final class ModuleDelegateSpy: BleModuleDelegate {
+    let onDisconnect: () -> Void
+    init(onDisconnect: @escaping () -> Void) { self.onDisconnect = onDisconnect }
+    func bluetoothAvailable(_ available: Bool) {}
+    func bluetoothState(_ state: CBManagerState) {}
+    func disconnected(from peripheral: PeripheralIdentifier, error: Error?) { onDisconnect() }
 }

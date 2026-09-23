@@ -63,11 +63,24 @@ extension BleTransport: BleModuleDelegate {
         let pending = pendingExchange
         pendingExchange = nil
         if case .failure = result { connectionUsable = false }
-        // Capture before invoking client code: it may start a different request.
-        let disconnectCompletion = waitingToDisconnectCompletion
+        let queuedDisconnect = waitingToDisconnectCompletion
         waitingToDisconnectCompletion = nil
+        // Reserve the earlier request before the exchange callback can reenter.
+        let shouldDisconnect = queuedDisconnect != nil && isConnected && !disconnecting
+        if shouldDisconnect {
+            disconnecting = true
+            disconnectCompletion = queuedDisconnect
+            connectionUsable = false
+        }
         pending?.finish(result)
-        if let disconnectCompletion { disconnect(completion: disconnectCompletion) }
+        if shouldDisconnect {
+            // The callback may itself have observed a physical disconnect.
+            if disconnecting { startPhysicalDisconnect() }
+        } else {
+            // A lost connection settles the queued request for the old link,
+            // even if the exchange callback reconnects synchronously.
+            queuedDisconnect?(nil)
+        }
     }
 
     private func failConnect(_ error: BleTransportError) {
@@ -270,6 +283,10 @@ extension BleTransport: BleModuleDelegate {
         disconnecting = true
         disconnectCompletion = completion
         connectionUsable = false
+        startPhysicalDisconnect()
+    }
+
+    private func startPhysicalDisconnect() {
         self.bleModule.disconnect { [weak self] result in
             guard let self else { return }
             if case .failure(let error) = result {

@@ -48,3 +48,8 @@ it and its callers when updating this fork.
 Device discovery: add the official Flex and Nano Gen5 normal-mode BLE service
 and characteristic UUIDs. The upstream repository is archived, so this fork's
 configuration must be kept current when Ledger adds supported device models.
+
+Disconnect review follow-up: module queue and generation cleanup now precede
+connection-failure callbacks. An exchange completion reserves an earlier queued
+disconnect before client code can reenter the transport. Simulated tests cover
+callback ordering and ownership; physical BLE behavior still needs device QA.

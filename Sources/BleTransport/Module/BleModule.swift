@@ -81,7 +81,7 @@ public class BleModule: NSObject {
         })
     }
 
-    private func clearAfterDisconnect(from peripheral: PeripheralIdentifier, error: Error?) {
+    func clearAfterDisconnect(from peripheral: PeripheralIdentifier, error: Error?, afterCleanup: @escaping () -> Void = {}) {
         DispatchQueue.main.async {
             self.connectionGeneration += 1
             self.connectedPeripheral?.invalidate()
@@ -89,6 +89,7 @@ public class BleModule: NSObject {
             self.listeners.removeAll()
             self.operationsQueue.removeAllUpToScanOrConnect {
                 self.delegate.disconnected(from: peripheral, error: error)
+                afterCleanup()
             }
         }
     }
@@ -249,17 +250,22 @@ extension BleModule: CBCentralManagerDelegate {
         // Preserve the cause for pending connection/exchange failures. A normal
         // app-switch disconnect still has no error and retains its old behavior.
         let peripheralIdentifier = PeripheralIdentifier(uuid: peripheral.identifier, name: peripheral.name)
-        operationsQueue.operationsOfType(Connect.self).first?.didDisconnectPeripheral(error: error)
-        operationsQueue.operationsOfType(Disconnect.self).first?.didDisconnectPeripheral(peripheral: peripheralIdentifier)
-        clearAfterDisconnect(from: peripheralIdentifier, error: error)
+        let connection = operationsQueue.operationsOfType(Connect.self).first
+        let disconnection = operationsQueue.operationsOfType(Disconnect.self).first
+        clearAfterDisconnect(from: peripheralIdentifier, error: error) {
+            connection?.didDisconnectPeripheral(error: error)
+            disconnection?.didDisconnectPeripheral(peripheral: peripheralIdentifier)
+        }
     }
 
     /**
      This mostly happens when either the Bluetooth device or the Core Bluetooth stack somehow only partially completes the negotiation of a connection. For simplicity we treat this as a disconnection event, so we can perform all the same clean up logic.
      */
     public func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
-        operationsQueue.operationsOfType(Connect.self).first?.didDisconnectPeripheral(error: error)
-        clearAfterDisconnect(from: PeripheralIdentifier(uuid: peripheral.identifier, name: peripheral.name), error: error)
+        let connection = operationsQueue.operationsOfType(Connect.self).first
+        clearAfterDisconnect(from: PeripheralIdentifier(uuid: peripheral.identifier, name: peripheral.name), error: error) {
+            connection?.didDisconnectPeripheral(error: error)
+        }
     }
 }
 
